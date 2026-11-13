@@ -1,0 +1,276 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+from datetime import datetime, timedelta
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    HAY_PLOTLY = True
+except ImportError:
+    HAY_PLOTLY = False
+
+# ==============================================================================
+# ESTILOS CSS (Mantiene la estética de tu consola)
+# ==============================================================================
+def inyectar_estilos():
+    st.markdown("""
+    <style>
+        .card-prod {
+            background: linear-gradient(145deg, #1E1B4B 0%, #312E81 100%);
+            border: 1px solid #4338CA;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 14px;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
+        }
+        .card-alert {
+            background: linear-gradient(145deg, #450A0A 0%, #7F1D1D 100%);
+            border: 1px solid #B91C1C;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 14px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ==============================================================================
+# PARSEO DE TIEMPOS BRIGHT PATTERN (HH:MM:SS a Segundos)
+# ==============================================================================
+def a_segundos(val):
+    """Convierte formatos de tiempo de Bright Pattern (HH:MM:SS o segundos) a segundos netos"""
+    if pd.isna(val) or val == "":
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip()
+    if ":" in s:
+        partes = s.split(":")
+        if len(partes) == 3: # HH:MM:SS
+            return int(partes[0]) * 3600 + int(partes[1]) * 60 + int(partes[2])
+        elif len(partes) == 2: # MM:SS
+            return int(partes[0]) * 60 + int(partes[1])
+    try:
+        return int(float(s))
+    except:
+        return 0
+
+def formatear_segundos(segundos):
+    """Convierte segundos a formato HH:MM:SS para fácil lectura"""
+    h = segundos // 3600
+    m = (segundos % 3600) // 60
+    s = segundos % 60
+    return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+
+# ==============================================================================
+# MÓDULO PRINCIPAL
+# ==============================================================================
+def renderizar_modulo_productividad(con):
+    inyectar_estilos()
+    
+    st.markdown("""
+        <div style="background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%); border: 1px solid #334155; border-radius: 12px; padding: 14px 20px; margin-bottom: 20px;">
+            <div style="font-size: 1.65rem; font-weight: 800; color: #F8FAFC;">
+                ⏱️ Análisis de Tiempos y Productividad (Bright Pattern)
+            </div>
+            <div style="font-size: 0.85rem; color: #94A3B8;">
+                Ranking de TMO excedido (>10 min), Horas de Conversación y Volumen Diario/Mensual.
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("📂 Cargar Reportes de Bright Pattern", expanded=True):
+        st.info("💡 Sube el reporte **'Interaction Records'** (para detalle de TMO > 10 min) o el **'Agent Performance'** (para acumulado mensual).")
+        archivo_bp = st.file_uploader("Sube tu exportación de Bright Pattern (CSV o Excel):", type=['csv', 'xlsx', 'xls'])
+
+    if archivo_bp is None:
+        st.warning("👈 Esperando archivo de Bright Pattern para generar rankings...")
+        return
+
+    # 1. LECTURA DEL ARCHIVO
+    try:
+        with st.spinner("Procesando datos de Bright Pattern..."):
+            if archivo_bp.name.endswith('.csv'):
+                df_bp = pd.read_csv(archivo_bp)
+            else:
+                df_bp = pd.read_excel(archivo_bp)
+    except Exception as e:
+        st.error(f"Error al leer el archivo: {e}")
+        return
+
+    # 2. DETECCIÓN AUTOMÁTICA DEL TIPO DE REPORTE
+    columnas_upper = [str(c).upper().strip() for c in df_bp.columns]
+    df_bp.columns = columnas_upper
+
+    es_interaction_record = any("START" in c for c in columnas_upper) and any(kw in c for kw in ["TALK", "DURATION"] for c in columnas_upper)
+    es_agent_performance = any("HANDLED" in c for c in columnas_upper) or "AGENT" in columnas_upper[0]
+
+    # Identificar columnas dinámicamente
+    col_agente = next((c for c in columnas_upper if "AGENT" in c or "AGENTE" in c or "NAME" in c), None)
+    col_fecha = next((c for c in columnas_upper if "DATE" in c or "START" in c or "FECHA" in c), None)
+    
+    # Si no encontramos columna de agente, no podemos seguir
+    if not col_agente:
+        st.error("❌ No se encontró la columna de Agente ('Agent Name') en el reporte.")
+        st.dataframe(df_bp.head())
+        return
+
+    df_bp = df_bp.dropna(subset=[col_agente])
+    df_bp["Agente_Limpio"] = df_bp[col_agente].astype(str).str.strip().str.upper()
+
+    t1, t2, t3 = st.tabs(["🚨 Ranking TMO Excedido (>10 min)", "🗣️ Top Horas Hablando", "📅 Volumen de Llamadas"])
+
+    # ==========================================================================
+    # TAB 1: RANKING TMO EXCEDIDO (Requiere Interaction Records)
+    # ==========================================================================
+    with t1:
+        col_talk = next((c for c in columnas_upper if "TALK" in c and "TIME" in c), None)
+        if not col_talk:
+            col_talk = next((c for c in columnas_upper if "DURATION" in c or "DURACION" in c), None)
+
+        if col_talk and es_interaction_record:
+            df_bp["Segundos_Talk"] = df_bp[col_talk].apply(a_segundos)
+            
+            # Filtro estricto: Mayor a 600 segundos (10 minutos)
+            df_excedidos = df_bp[df_bp["Segundos_Talk"] >= 600].copy()
+            
+            if not df_excedidos.empty:
+                # Agrupar por agente para ver quién repite más esta mala práctica
+                ranking_tmo = df_excedidos.groupby("Agente_Limpio").agg(
+                    Faltas_TMO=('Segundos_Talk', 'count'),
+                    Max_Llamada=('Segundos_Talk', 'max'),
+                    Total_Tiempo_Perdido=('Segundos_Talk', 'sum')
+                ).reset_index().sort_values(by="Faltas_TMO", ascending=False)
+
+                ranking_tmo["Max_Llamada"] = ranking_tmo["Max_Llamada"].apply(formatear_segundos)
+                ranking_tmo["Total_Tiempo_Perdido"] = ranking_tmo["Total_Tiempo_Perdido"].apply(formatear_segundos)
+
+                c_al1, c_al2 = st.columns([1, 2])
+                c_al1.markdown(f"""
+                <div class="card-alert">
+                    <div style="font-size: 0.85rem; color: #FECACA; text-transform: uppercase;">⚠️ Llamadas Críticas (>10 Min)</div>
+                    <div style="font-size: 2.2rem; font-weight: 800; color: #FCA5A5; margin: 4px 0;">{len(df_excedidos)}</div>
+                    <div style="font-size: 0.85rem; color: #FECACA;">Peligro para el Nivel de Servicio</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                c_al2.markdown("### 🏆 Muro de los TMOs Altos")
+                st.dataframe(
+                    ranking_tmo,
+                    column_config={
+                        "Agente_Limpio": "Ejecutivo",
+                        "Faltas_TMO": st.column_config.ProgressColumn("N° Llamadas > 10m", format="%d", min_value=0, max_value=int(ranking_tmo["Faltas_TMO"].max())),
+                        "Max_Llamada": "Peor Llamada (TMO)",
+                        "Total_Tiempo_Perdido": "Tiempo Total Excedido"
+                    },
+                    hide_index=True, use_container_width=True
+                )
+            else:
+                st.success("🎉 ¡Excelente! Nadie ha superado los 10 minutos por llamada en este reporte.")
+        else:
+            st.warning("Para ver el ranking de llamadas > 10 min exactas, necesitas subir el reporte **'Interaction Records'** que traiga la duración de CADA llamada, no el consolidado.")
+
+    # ==========================================================================
+    # TAB 2: TOP HORAS HABLANDO (Productividad Bruta)
+    # ==========================================================================
+    with t2:
+        if col_talk:
+            if "Segundos_Talk" not in df_bp.columns:
+                df_bp["Segundos_Talk"] = df_bp[col_talk].apply(a_segundos)
+                
+            # Agrupar total de segundos por agente
+            ranking_horas = df_bp.groupby("Agente_Limpio")["Segundos_Talk"].sum().reset_index()
+            ranking_horas = ranking_horas.sort_values(by="Segundos_Talk", ascending=False)
+            
+            # Formatear
+            ranking_horas["Horas_Efectivas"] = ranking_horas["Segundos_Talk"] / 3600 # A decimales para el gráfico
+            ranking_horas["Tiempo_Formato"] = ranking_horas["Segundos_Talk"].apply(formatear_segundos)
+            
+            top_agente = ranking_horas.iloc[0] if not ranking_horas.empty else None
+
+            if top_agente is not None:
+                st.markdown(f"""
+                <div class="card-prod">
+                    <div style="font-size: 0.85rem; color: #C7D2FE; text-transform: uppercase;">🔥 Operador de Hierro (Mayor tiempo hablando)</div>
+                    <div style="font-size: 1.8rem; font-weight: 800; color: #818CF8; margin: 4px 0;">{top_agente['Agente_Limpio']}</div>
+                    <div style="font-size: 1rem; color: #E0E7FF;">{top_agente['Tiempo_Formato']} netos al teléfono.</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            c_graf_h, c_tbl_h = st.columns([2, 1])
+            
+            with c_graf_h:
+                if HAY_PLOTLY:
+                    fig_h = px.bar(ranking_horas.head(15), x="Agente_Limpio", y="Horas_Efectivas", 
+                                   title="Top 15 - Horas Netas de Conversación", 
+                                   text_auto='.1f', color="Horas_Efectivas", color_continuous_scale="Purp")
+                    fig_h.update_layout(template="plotly_dark", xaxis_title="", yaxis_title="Horas")
+                    st.plotly_chart(fig_h, use_container_width=True)
+            
+            with c_tbl_h:
+                st.dataframe(
+                    ranking_horas[["Agente_Limpio", "Tiempo_Formato"]],
+                    column_config={"Agente_Limpio": "Ejecutivo", "Tiempo_Formato": "Total Hablado"},
+                    hide_index=True, use_container_width=True, height=400
+                )
+        else:
+            st.error("No se encontró una columna de 'Talk Time' o 'Duration' en el archivo.")
+
+    # ==========================================================================
+    # TAB 3: VOLUMEN DE LLAMADAS (Diario / Mensual)
+    # ==========================================================================
+    with t3:
+        # Detectar columna de llamadas (Interaction records cada fila es 1, Agent perf trae la columna Handled)
+        col_llamadas = next((c for c in columnas_upper if "HANDLED" in c or "ATENDIDAS" in c or "CALLS" in c), None)
+        
+        if es_interaction_record:
+            # Si es el registro detallado, cada fila es 1 llamada
+            df_bp["Cant_Llamadas"] = 1
+        elif col_llamadas:
+            df_bp["Cant_Llamadas"] = pd.to_numeric(df_bp[col_llamadas], errors="coerce").fillna(0)
+        else:
+            st.warning("No se pudo detectar la columna de llamadas atendidas ('Handled').")
+            df_bp["Cant_Llamadas"] = 1 # Fallback
+            
+        # Determinar si hay fechas para desglose diario
+        tiene_fechas = col_fecha is not None
+
+        c_v1, c_v2 = st.columns([1, 3])
+        vista_mensual = c_v1.radio("Visualización de Volumen:", ["Ver Total Mensual / General", "Ver Desglose Diario"])
+
+        if vista_mensual == "Ver Total Mensual / General" or not tiene_fechas:
+            volumen = df_bp.groupby("Agente_Limpio")["Cant_Llamadas"].sum().reset_index()
+            volumen = volumen.sort_values(by="Cant_Llamadas", ascending=False)
+            
+            st.markdown("### 🏆 Ranking Total de Volumen de Atenciones")
+            st.dataframe(
+                volumen,
+                column_config={
+                    "Agente_Limpio": "Ejecutivo",
+                    "Cant_Llamadas": st.column_config.NumberColumn("Total Llamadas Atendidas", format="%d")
+                },
+                hide_index=True, use_container_width=True
+            )
+        else:
+            # Limpiar fecha (quitar horas si existen)
+            df_bp["Fecha_Corta"] = pd.to_datetime(df_bp[col_fecha], errors='coerce').dt.strftime('%Y-%m-%d')
+            
+            fechas_disponibles = sorted(df_bp["Fecha_Corta"].dropna().unique())
+            dia_sel = c_v2.selectbox("📅 Selecciona el Día a analizar:", fechas_disponibles)
+            
+            df_dia = df_bp[df_bp["Fecha_Corta"] == dia_sel]
+            volumen_dia = df_dia.groupby("Agente_Limpio")["Cant_Llamadas"].sum().reset_index()
+            volumen_dia = volumen_dia.sort_values(by="Cant_Llamadas", ascending=False)
+            
+            total_dia = int(volumen_dia["Cant_Llamadas"].sum())
+            
+            st.markdown(f"**Total atenciones del piso el día {dia_sel}:** {total_dia} llamadas")
+            
+            if HAY_PLOTLY:
+                fig_v = px.bar(volumen_dia.head(20), x="Agente_Limpio", y="Cant_Llamadas",
+                               title=f"Volumen de Llamadas Atendidas - {dia_sel}", text="Cant_Llamadas",
+                               color="Cant_Llamadas", color_continuous_scale="Teal")
+                fig_v.update_layout(template="plotly_dark", xaxis_title="")
+                st.plotly_chart(fig_v, use_container_width=True)
+            else:
+                st.dataframe(volumen_dia, hide_index=True, use_container_width=True)
