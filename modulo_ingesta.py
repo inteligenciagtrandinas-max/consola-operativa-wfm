@@ -1,8 +1,9 @@
-import streamlit as st
+import streamlit as str_lit
 import pandas as pd
 import os
 import glob
 import shutil
+import uuid
 from datetime import datetime
 
 CARPETA_ALMACEN = "_almacen_wfm"
@@ -18,11 +19,11 @@ MAPA_TABLAS_SLOTS = {
 # ==============================================================================
 # CACHÉ DE RECURSO (MEMORIA COMPARTIDA ULTRARRÁPIDA)
 # ==============================================================================
-@st.cache_resource(show_spinner=False)
+@str_lit.cache_resource(show_spinner=False)
 def leer_excel_compartido(ruta_archivo, mtime):
     return pd.read_excel(ruta_archivo, sheet_name=None)
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@str_lit.cache_data(show_spinner=False, max_entries=8)
 def leer_csv_flexible(ruta_archivo, mtime):
     for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
         for sep in (",", ";", "\t"):
@@ -76,8 +77,8 @@ def registrar_en_compartimiento(con, slot_id, nombre_archivo, ruta_archivo, tipo
 # ==============================================================================
 def reconstruir_hojas_excel_en_memoria(con):
     asegurar_estructura_compartimientos(con)
-    if "compartimientos_excel" not in st.session_state:
-        st.session_state["compartimientos_excel"] = {}
+    if "compartimientos_excel" not in str_lit.session_state:
+        str_lit.session_state["compartimientos_excel"] = {}
 
     df_reg = con.execute("""
         SELECT slot_id, ruta_archivo 
@@ -100,15 +101,15 @@ def reconstruir_hojas_excel_en_memoria(con):
                 try:
                     mtime = os.path.getmtime(ruta)
                     hojas = leer_excel_compartido(ruta, mtime)
-                    st.session_state["compartimientos_excel"][s_id] = hojas
+                    str_lit.session_state["compartimientos_excel"][s_id] = hojas
                     hojas_combinadas.update(hojas)
                     if s_id == "intervalos" or "Cuadro de Mando" in hojas:
                         hojas_intervalos.update(hojas)
                 except Exception as e:
                     print(f"Error cargando compartimiento Excel {s_id}: {e}")
 
-    st.session_state["excel_colaciones_hojas"] = hojas_combinadas
-    st.session_state["excel_intervalos_hojas"] = hojas_intervalos if hojas_intervalos else hojas_combinadas
+    str_lit.session_state["excel_colaciones_hojas"] = hojas_combinadas
+    str_lit.session_state["excel_intervalos_hojas"] = hojas_intervalos if hojas_intervalos else hojas_combinadas
 
 def cargar_tabla_desde_df(con, df, nombre_tabla, fecha_activa_str):
     if df is None or df.empty:
@@ -116,20 +117,40 @@ def cargar_tabla_desde_df(con, df, nombre_tabla, fecha_activa_str):
     df_save = df.copy()
     df_save["fecha_gestion"] = fecha_activa_str
 
-    con.execute(f"DROP TABLE IF EXISTS {nombre_tabla}")
-    con.register("t_temp_ing", df_save)
-    con.execute(f"CREATE TABLE {nombre_tabla} AS SELECT * FROM t_temp_ing")
-    con.unregister("t_temp_ing")
+    uid = uuid.uuid4().hex[:8]
+    temp_ing = f"t_temp_ing_{uid}"
 
-    # Espejo automático entre Actividad (5) y Pausas (6)
+    con.execute(f"DROP TABLE IF EXISTS {nombre_tabla}")
+    con.register(temp_ing, df_save)
+    try:
+        con.execute(f"CREATE TABLE {nombre_tabla} AS SELECT * FROM {temp_ing}")
+    finally:
+        try:
+            con.unregister(temp_ing)
+        except Exception:
+            pass
+
+    # Espejo automático entre Actividad (5) y Pausas (6) con nombres únicos
     if nombre_tabla == "datos_pausas" and not tabla_existe_con_datos(con, "datos_productividad_tmo"):
-        con.register("t_temp_esp", df_save)
-        con.execute("CREATE TABLE datos_productividad_tmo AS SELECT * FROM t_temp_esp")
-        con.unregister("t_temp_esp")
+        temp_esp = f"t_temp_esp_{uid}"
+        con.register(temp_esp, df_save)
+        try:
+            con.execute(f"CREATE TABLE datos_productividad_tmo AS SELECT * FROM {temp_esp}")
+        finally:
+            try:
+                con.unregister(temp_esp)
+            except Exception:
+                pass
     elif nombre_tabla == "datos_productividad_tmo" and not tabla_existe_con_datos(con, "datos_pausas"):
-        con.register("t_temp_esp2", df_save)
-        con.execute("CREATE TABLE datos_pausas AS SELECT * FROM t_temp_esp2")
-        con.unregister("t_temp_esp2")
+        temp_esp2 = f"t_temp_esp2_{uid}"
+        con.register(temp_esp2, df_save)
+        try:
+            con.execute(f"CREATE TABLE datos_pausas AS SELECT * FROM {temp_esp2}")
+        finally:
+            try:
+                con.unregister(temp_esp2)
+            except Exception:
+                pass
 
 def sincronizar_tablas_y_fechas_activas(con, fecha_activa_str):
     asegurar_estructura_compartimientos(con)
@@ -182,7 +203,6 @@ def precargar_archivos_locales(con, fecha_activa_str, forzar_reescaneo=False):
     if forzar_reescaneo:
         con.execute("DELETE FROM registro_compartimientos_wfm WHERE nombre_archivo = 'VACIADO_MANUAL'")
 
-    # Si las Bases Maestras 1 y 2 quedaron en VACIADO_MANUAL por un reseteo previo, desbloquearlas automáticamente al arrancar
     df_check_maestras = con.execute("""
         SELECT count(*) FROM registro_compartimientos_wfm 
         WHERE slot_id IN ('malla', 'bbdd') AND nombre_archivo != 'VACIADO_MANUAL'
@@ -261,7 +281,7 @@ def precargar_archivos_locales(con, fecha_activa_str, forzar_reescaneo=False):
     sincronizar_tablas_y_fechas_activas(con, fecha_activa_str)
 
     if archivos_nuevos:
-        st.session_state["version_datos"] = st.session_state.get("version_datos", 1) + 1
+        str_lit.session_state["version_datos"] = str_lit.session_state.get("version_datos", 1) + 1
 
     return archivos_nuevos
 
@@ -332,8 +352,8 @@ def vaciar_compartimiento_individual(con, slot_id, tipo_slot, tabla_sql):
         except Exception:
             pass
 
-    st.cache_data.clear()
-    st.session_state["version_datos"] = st.session_state.get("version_datos", 1) + 1
+    str_lit.cache_data.clear()
+    str_lit.session_state["version_datos"] = str_lit.session_state.get("version_datos", 1) + 1
 
 def reiniciar_intervalos_y_login_del_dia(con, fecha_activa_str):
     vaciar_compartimiento_individual(con, "login", "TABLA", "datos_login_logout")
@@ -341,14 +361,14 @@ def reiniciar_intervalos_y_login_del_dia(con, fecha_activa_str):
         con.execute(f"DELETE FROM control_intervalos_diario WHERE fecha = '{fecha_activa_str}'")
     except Exception:
         pass
-    st.cache_data.clear()
-    st.session_state["version_datos"] = st.session_state.get("version_datos", 1) + 1
+    str_lit.cache_data.clear()
+    str_lit.session_state["version_datos"] = str_lit.session_state.get("version_datos", 1) + 1
 
 # ==============================================================================
 # RENDERIZADO DEL MÓDULO DE INGESTA
 # ==============================================================================
 def renderizar_ingesta(con, fecha_activa_str):
-    st.markdown("""
+    str_lit.markdown("""
     <style>
         .slot-active-card {
             background: linear-gradient(135deg, rgba(16, 185, 129, 0.2) 0%, rgba(15, 23, 42, 0.92) 100%);
@@ -375,46 +395,43 @@ def renderizar_ingesta(con, fecha_activa_str):
     </div>
     """, unsafe_allow_html=True)
 
-    # Pre-cargar automáticamente en la primera ejecución
-    if "ingesta_inicial_verificada" not in st.session_state:
+    if "ingesta_inicial_verificada" not in str_lit.session_state:
         archivos_autocargados = precargar_archivos_locales(con, fecha_activa_str, forzar_reescaneo=False)
-        st.session_state["ingesta_inicial_verificada"] = True
+        str_lit.session_state["ingesta_inicial_verificada"] = True
         if archivos_autocargados:
-            st.toast(f"🤖 Pre-cargados en memoria: {', '.join(archivos_autocargados)}", icon="✅")
-    elif not st.session_state.get("excel_colaciones_hojas"):
+            str_lit.toast(f"🤖 Pre-cargados en memoria: {', '.join(archivos_autocargados)}", icon="✅")
+    elif not str_lit.session_state.get("excel_colaciones_hojas"):
         reconstruir_hojas_excel_en_memoria(con)
 
-    # Mostrar avisos de éxito guardados tras el último procesamiento manual
-    if "mensajes_exito_ingesta" in st.session_state and st.session_state["mensajes_exito_ingesta"]:
-        for msg in st.session_state["mensajes_exito_ingesta"]:
-            st.success(msg)
-        st.session_state["mensajes_exito_ingesta"] = []
+    if "mensajes_exito_ingesta" in str_lit.session_state and str_lit.session_state["mensajes_exito_ingesta"]:
+        for msg in str_lit.session_state["mensajes_exito_ingesta"]:
+            str_lit.success(msg)
+        str_lit.session_state["mensajes_exito_ingesta"] = []
 
-    # Barra de acciones rápidas del día
-    c_qr1, c_qr2, c_qr3 = st.columns(3)
+    c_qr1, c_qr2, c_qr3 = str_lit.columns(3)
     with c_qr1:
-        if st.button("🔄 Reiniciar SOLO Intervalos + Login/Logout", use_container_width=True):
+        if str_lit.button("🔄 Reiniciar SOLO Intervalos + Login/Logout", use_container_width=True):
             reiniciar_intervalos_y_login_del_dia(con, fecha_activa_str)
-            st.session_state["mensajes_exito_ingesta"] = [f"✅ Intervalos del día ({fecha_activa_str}) y Login/Logout reiniciados a cero. Las Bases Maestras 1, 2 y 3 siguen activas."]
-            st.rerun()
+            str_lit.session_state["mensajes_exito_ingesta"] = [f"✅ Intervalos del día ({fecha_activa_str}) y Login/Logout reiniciados a cero. Las Bases Maestras 1, 2 y 3 siguen activas."]
+            str_lit.rerun()
 
     with c_qr2:
-        if st.button("🌅 Limpiar Reportes Diarios (4 al 8)", use_container_width=True):
+        if str_lit.button("🌅 Limpiar Reportes Diarios (4 al 8)", use_container_width=True):
             reiniciar_intervalos_y_login_del_dia(con, fecha_activa_str)
             for s_dia, t_sql in [("actividad", "datos_productividad_tmo"), ("pausas", "datos_pausas"), ("extra", "datos_adicionales"), ("cybel", "datos_cybel")]:
                 vaciar_compartimiento_individual(con, s_dia, "TABLA", t_sql)
-            st.session_state["mensajes_exito_ingesta"] = ["✅ Todos los reportes diarios (4 al 8) fueron limpiados. Tus Bases Maestras (1, 2 y 3) permanecen intactas."]
-            st.rerun()
+            str_lit.session_state["mensajes_exito_ingesta"] = ["✅ Todos los reportes diarios (4 al 8) fueron limpiados. Tus Bases Maestras (1, 2 y 3) permanecen intactas."]
+            str_lit.rerun()
 
     with c_qr3:
-        if st.button("🔍 Restaurar Archivos Locales de la Carpeta", use_container_width=True):
+        if str_lit.button("🔍 Restaurar Archivos Locales de la Carpeta", use_container_width=True):
             nuevos = precargar_archivos_locales(con, fecha_activa_str, forzar_reescaneo=True)
-            st.cache_data.clear()
-            st.session_state["version_datos"] = st.session_state.get("version_datos", 1) + 1
-            st.session_state["mensajes_exito_ingesta"] = [f"✅ Se restauraron y vincularon los archivos locales de la carpeta ({len(nuevos)} archivos detectados)."]
-            st.rerun()
+            str_lit.cache_data.clear()
+            str_lit.session_state["version_datos"] = str_lit.session_state.get("version_datos", 1) + 1
+            str_lit.session_state["mensajes_exito_ingesta"] = [f"✅ Se restauraron y vincularon los archivos locales de la carpeta ({len(nuevos)} archivos detectados)."]
+            str_lit.rerun()
 
-    st.markdown("<hr style='border: 1px solid rgba(255,255,255,0.08); margin: 15px 0;'>", unsafe_allow_html=True)
+    str_lit.markdown("<hr style='border: 1px solid rgba(255,255,255,0.08); margin: 15px 0;'>", unsafe_allow_html=True)
 
     df_slots = con.execute("SELECT * FROM registro_compartimientos_wfm").df()
     mapa_slots = {r["slot_id"]: r.to_dict() for _, r in df_slots.iterrows()} if not df_slots.empty else {}
@@ -428,7 +445,7 @@ def renderizar_ingesta(con, fecha_activa_str):
             and os.path.exists(str(info.get("ruta_archivo")))
         )
         if esta_activo:
-            st.markdown(f"""
+            str_lit.markdown(f"""
             <div class="slot-active-card">
                 <div style="font-size: 0.74rem; color: #34D399; font-weight: 800; text-transform: uppercase;">
                     ✅ {titulo} — ACTIVO EN MEMORIA
@@ -441,12 +458,12 @@ def renderizar_ingesta(con, fecha_activa_str):
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            if st.button(f"🗑️ Quitar de {titulo[:2]}", key=f"btn_del_{slot_id}", use_container_width=True):
+            if str_lit.button(f"🗑️ Quitar de {titulo[:2]}", key=f"btn_del_{slot_id}", use_container_width=True):
                 vaciar_compartimiento_individual(con, slot_id, tipo_slot, tabla_sql)
-                st.session_state["mensajes_exito_ingesta"] = [f"🗑️ Se quitó el archivo del compartimiento {titulo}."]
-                st.rerun()
+                str_lit.session_state["mensajes_exito_ingesta"] = [f"🗑️ Se quitó el archivo del compartimiento {titulo}."]
+                str_lit.rerun()
         else:
-            st.markdown(f"""
+            str_lit.markdown(f"""
             <div class="slot-empty-card">
                 <div style="font-size: 0.74rem; color: #94A3B8; font-weight: 800; text-transform: uppercase;">
                     ⚪ {titulo} — COMPARTIMIENTO VACÍO
@@ -457,60 +474,48 @@ def renderizar_ingesta(con, fecha_activa_str):
             </div>
             """, unsafe_allow_html=True)
 
-    # ==============================================================================
-    # COMPARTIMIENTOS 1, 2 Y 3: BASES MAESTRAS DE PLANIFICACIÓN
-    # ==============================================================================
-    st.markdown("<h4 style='color: #818CF8; margin-bottom: 12px;'>📊 Bases Maestras de Planificación (Permanentes)</h4>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
+    str_lit.markdown("<h4 style='color: #818CF8; margin-bottom: 12px;'>📊 Bases Maestras de Planificación (Permanentes)</h4>", unsafe_allow_html=True)
+    c1, c2, c3 = str_lit.columns(3)
     with c1:
         mostrar_estado_compartimiento("malla", "1️⃣ Malla BDD y Turnos", "EXCEL")
-        arch_malla = st.file_uploader("1️⃣ Malla BDD y Turnos (Excel)", type=["xlsx", "xls", "xlsm"], key="up_malla")
+        arch_malla = str_lit.file_uploader("1️⃣ Malla BDD y Turnos (Excel)", type=["xlsx", "xls", "xlsm"], key="up_malla")
     with c2:
         mostrar_estado_compartimiento("bbdd", "2️⃣ BBDD Cliente Final", "EXCEL")
-        arch_bbdd = st.file_uploader("2️⃣ BBDD Cliente Final (Semanal)", type=["xlsx", "xls", "xlsm"], key="up_bbdd")
+        arch_bbdd = str_lit.file_uploader("2️⃣ BBDD Cliente Final (Semanal)", type=["xlsx", "xls", "xlsm"], key="up_bbdd")
     with c3:
         mostrar_estado_compartimiento("intervalos", "3️⃣ Cuadro de Mando / Intervalos", "EXCEL")
-        arch_intervalos = st.file_uploader("3️⃣ Cuadro de Mando / Intervalos", type=["xlsx", "xls", "xlsm"], key="up_inter")
+        arch_intervalos = str_lit.file_uploader("3️⃣ Cuadro de Mando / Intervalos", type=["xlsx", "xls", "xlsm"], key="up_inter")
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    str_lit.markdown("<br>", unsafe_allow_html=True)
 
-    # ==============================================================================
-    # COMPARTIMIENTOS 4, 5 Y 6: REPORTES OPERATIVOS BRIGHT PATTERN
-    # ==============================================================================
-    st.markdown(f"<h4 style='color: #34D399; margin-bottom: 12px;'>📞 Reportes Operativos Bright Pattern (Día: {fecha_activa_str})</h4>", unsafe_allow_html=True)
-    c4, c5, c6 = st.columns(3)
+    str_lit.markdown(f"<h4 style='color: #34D399; margin-bottom: 12px;'>📞 Reportes Operativos Bright Pattern (Día: {fecha_activa_str})</h4>", unsafe_allow_html=True)
+    c4, c5, c6 = str_lit.columns(3)
     with c4:
         mostrar_estado_compartimiento("login", "4️⃣ BP Login/Logout", "TABLA", "datos_login_logout")
-        arch_login = st.file_uploader("4️⃣ BP Login/Logout (Sesiones)", type=["csv", "txt"], key="up_log")
+        arch_login = str_lit.file_uploader("4️⃣ BP Login/Logout (Sesiones)", type=["csv", "txt"], key="up_log")
     with c5:
         mostrar_estado_compartimiento("actividad", "5️⃣ BP Agent Activity", "TABLA", "datos_productividad_tmo")
-        arch_actividad = st.file_uploader("5️⃣ BP Agent Activity (Productividad)", type=["csv", "txt"], key="up_act")
+        arch_actividad = str_lit.file_uploader("5️⃣ BP Agent Activity (Productividad)", type=["csv", "txt"], key="up_act")
     with c6:
         mostrar_estado_compartimiento("pausas", "6️⃣ BP Agent State", "TABLA", "datos_pausas")
-        arch_pausas = st.file_uploader("6️⃣ BP Agent State (Pausas y Baños)", type=["csv", "txt"], key="up_pau")
+        arch_pausas = str_lit.file_uploader("6️⃣ BP Agent State (Pausas y Baños)", type=["csv", "txt"], key="up_pau")
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    str_lit.markdown("<br>", unsafe_allow_html=True)
 
-    # ==============================================================================
-    # COMPARTIMIENTOS 7 Y 8: ANEXOS Y CYBEL
-    # ==============================================================================
-    st.markdown("<h4 style='color: #FBBF24; margin-bottom: 12px;'>📎 Anexos y Reportes Cybel</h4>", unsafe_allow_html=True)
-    c7, c10 = st.columns(2)
+    str_lit.markdown("<h4 style='color: #FBBF24; margin-bottom: 12px;'>📎 Anexos y Reportes Cybel</h4>", unsafe_allow_html=True)
+    c7, c10 = str_lit.columns(2)
     with c7:
         mostrar_estado_compartimiento("extra", "7️⃣ Base Complementaria", "TABLA", "datos_adicionales")
-        arch_extra = st.file_uploader("7️⃣ Base Complementaria (Opcional)", type=["csv", "xlsx", "xls", "xlsm"], key="up_ext")
+        arch_extra = str_lit.file_uploader("7️⃣ Base Complementaria (Opcional)", type=["csv", "xlsx", "xls", "xlsm"], key="up_ext")
     with c10:
         mostrar_estado_compartimiento("cybel", "8️⃣ Exportación Cybel", "TABLA", "datos_cybel")
-        arch_cybel = st.file_uploader("8️⃣ Exportación CSV / XLS Cybel", type=["csv", "xlsx", "xls", "xlsm"], key="up_cyb")
+        arch_cybel = str_lit.file_uploader("8️⃣ Exportación CSV / XLS Cybel", type=["csv", "xlsx", "xls", "xlsm"], key="up_cyb")
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    str_lit.markdown("<br>", unsafe_allow_html=True)
 
-    # ==============================================================================
-    # BOTÓN PRINCIPAL VERDE DE CONFIRMACIÓN Y GUARDADO
-    # ==============================================================================
-    if st.button("🚀 PROCESAR Y GUARDAR ARCHIVOS SUBIDOS", use_container_width=True, type="primary"):
+    if str_lit.button("🚀 PROCESAR Y GUARDAR ARCHIVOS SUBIDOS", use_container_width=True, type="primary"):
         mensajes = []
-        with st.spinner("⏳ Guardando archivos en sus compartimientos y actualizando base de datos..."):
+        with str_lit.spinner("⏳ Guardando archivos en sus compartimientos y actualizando base de datos..."):
             if arch_malla is not None:
                 mensajes.append(guardar_archivo_en_slot(con, arch_malla, "malla", "EXCEL", None, fecha_activa_str))
             if arch_bbdd is not None:
@@ -533,7 +538,7 @@ def renderizar_ingesta(con, fecha_activa_str):
                 reconstruir_hojas_excel_en_memoria(con)
                 mensajes.append("✅ Todos los compartimientos activos fueron verificados y sincronizados con éxito.")
 
-            st.cache_data.clear()
-            st.session_state["version_datos"] = st.session_state.get("version_datos", 1) + 1
-            st.session_state["mensajes_exito_ingesta"] = mensajes
-        st.rerun()
+            str_lit.cache_data.clear()
+            str_lit.session_state["version_datos"] = str_lit.session_state.get("version_datos", 1) + 1
+            str_lit.session_state["mensajes_exito_ingesta"] = mensajes
+        str_lit.rerun()
